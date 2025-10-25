@@ -1,0 +1,583 @@
+---
+title: "Investigating the Early Life Airway Fungal Microbiome"
+author: "Juan Carlos Guevara<br>Siyuan Ma, Ph.D.<br>Department of Biostatistics, Vanderbilt University Medical Center<br>Christian Rosas-Salazar, MD, MPH<br>Department of Pediatrics, Vanderbilt University Medical Center"
+date: "June 17, 2025"
+output: 
+  html_document:
+    code_folding: hide  # Options: "hide", "show", or "none"
+    theme: "readable"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+- [1 Introduction](#introduction)  
+
+- [2 Data Description](#description)  
+
+- [3 Characteristics of Children in Study Stratified by Recurrent Wheezing Status](#characteristics)  
+
+- [4 Inspection of Potential Covariates](#variables)
+
+- [5 Inspection of Fungi variables](#fungi)
+
+- [6 Exploring Average Abundance and Prevalence among all Fungi](#stacked)
+
+- [7 Logistic Regression Model](#logistic)
+
+- [8 Issues in The Logistic Regression Model](#issues)
+
+- [9 Firth's Penalized Logistic Regression Model](#firths)
+
+- [10 P-value Correction](#pval)
+
+- [11 Conclusion](#conclusion)
+
+## 1 Introduction {#introduction}
+
+Investigating the Early Life Airway Fungal Microbiome is an exploratory study examining the potential role of the fungal microbiome (mycobiome) in the development of recurrent wheezing (≥3 episodes/year) in children. While most microbiome research has focused on bacterial communities, this study specifically investigates the understudied airway mycobiome and its association with respiratory outcomes. We are asking a simple but important question: Are certain fungi more common in kids who develop recurrent wheezing? Our study includes children between the ages 2 and 5.5 years old. During early childhood, they had nasal swabs collected, which was later used to identify fungi through DNA sequencing. Logistic Regression models were used to predict the presence of the fungi with recurrent wheezing as the main predictor. In addition we adjusted for race/ethnicity, season, maternal atopy.
+
+Subject IDs and other identifying information are fully anonymized in this study to preserve privacy
+
+```{r, message=FALSE}
+library(ggplot2)
+library(vcd)
+library(Hmisc)
+library(gtsummary)
+library(dplyr)
+library(tidyr)
+library(RColorBrewer)
+library(viridis)
+library(plotly)
+library(logistf)
+library(ggrepel)
+library(gt)
+library(gtExtras)
+library(forcats)
+library(knitr)
+library(patchwork)
+```
+
+```{r}
+# Load data
+metadata <- read.csv("metadata.csv")
+fungaldata <- read.csv("genus_table.csv")
+
+# Convert recurrent_wheezing variable from numeric (1/0) to character ("yes"/"no")
+metadata[["recurrent_wheezing"]] <- ifelse(metadata[["recurrent_wheezing"]] == 1, "yes", "no")
+metadata <- metadata[!is.na(metadata[,"recurrent_wheezing"]),]
+
+```
+
+<br>
+
+## 2 Data Description {#description}
+
+We used two datasets for this analysis. The first includes participant characteristics such as age, race/ethnicity, season, and whether the child has recurrent wheezing. Below is the first few rows of the dataset.
+
+```{r}
+# Presentable metadata table
+
+metadata_table <- head(metadata) %>%
+  gt() %>%
+  tab_header(title = "Preview of Metadata") %>%
+  fmt_number(columns = where(is.numeric), decimals = 2)
+
+metadata_table
+```
+
+The second dataset we are working with contains detailed fungal abundance data for 73 different fungi, measured from each child's nasal swab. We can notice something important already only looking at a few rows and a few fungi, this is that most of the fungi abundance is 0. Another important detail to note is that for each subject the abundance of all the fungi combined should add up to 1.
+
+```{r}
+# Presentable fungal abundance table
+
+presentable_fungi <- c("Didymellaceae_unclassified", "Talaromyces", "Ascomycota_unclassified", "Aspergillus", "subject_id")
+present_subset <- fungaldata[,presentable_fungi]
+
+fungi_table <- present_subset %>% 
+  head(6) %>% 
+  gt() %>% 
+  tab_header(title = "Preview of Fungaldata (4 Selected Fungi)") %>%
+  fmt_number(columns = where(is.numeric), decimals = 3)
+
+fungi_table
+```
+
+Since our main predictor for the presence of a fungi is recurrent wheezing we exclude the children who are missing this data. Therefore from our 147 children we are left with 140 children to analyze. We merge the two datasets by subject id.
+
+```{r}
+fungalmetadata <- merge(metadata, fungaldata, by = "subject_id", all = TRUE)
+cleandata <- fungalmetadata[!is.na(fungalmetadata[,"recurrent_wheezing"]),]
+```
+
+## 3 Characteristics of Children in Study Stratified by Recurrent Wheezing Status {#characteristics}
+
+```{r}
+# Recode categorical variables for clarity and consistency in analysis:
+
+cleandata <- cleandata %>%
+  mutate(race_ethnicity = fct_recode(race_ethnicity,
+                                     "Asian" = "asian",
+                                     "Black (Non-Hispanic)" = "black_nh",
+                                     "Hispanic" = "hispanic",
+                                     "Multiple Races" = "multiple",
+                                     "White (Non-Hispanic)" = "white_nh"))
+
+cleandata <- cleandata %>% 
+  mutate(sex = fct_recode(sex,
+                          "Female" = "female",
+                          "Male" = "male"))
+
+cleandata <- cleandata %>% 
+  mutate(warm_season = fct_recode(warm_season,
+                          "Cold (Nov-Mar)" = "cold (nov-mar)",
+                          "Warm (Apr - Oct)" = "warm (apr-oct)"))
+```
+
+```{r}
+# Create TableOne
+table_1 <- tbl_summary(
+  data = cleandata,
+  by = recurrent_wheezing,
+  include = c(sex, race_ethnicity, age, warm_season, maternal_atopy, maternal_asthma, Ascomycota_unclassified, Talaromyces),
+  statistic = list(all_categorical() ~ "{n} ({p}%)"),
+  label = list(
+    sex ~ "Sex",
+    race_ethnicity ~ "Race/Ethnicity",
+    age ~ "Age",
+    warm_season ~ "Month microbiome was sampled",
+    maternal_atopy ~ "Maternal Atopy",
+    maternal_asthma ~ "Maternal Asthma",
+    Ascomycota_unclassified ~ "Ascomycota (Unclassified)",
+    Talaromyces ~ "Talaromyces"
+  )
+) %>%
+  add_overall(last = TRUE) %>%
+  add_p() %>%
+  bold_labels() %>%
+  modify_header(label ~ "**Variable**") %>%
+  modify_caption("**Table 1. Demographic Characteristics of Children With and Without Recurrent Wheezing**") %>%
+  modify_spanning_header(all_stat_cols() ~ "**Recurrent Wheezing Status**") %>%
+  modify_header(stat_1 ~ "**No Recurrent Wheezing (N = {n})**", stat_2 ~ "**Recurrent Wheezing (N = {n})**")
+
+table_1
+```
+
+Important observations from Table 1: Males had higher wheezing prevalence (70% vs. 55% in non-wheezers), though not statistically significant (*p=0.2*). Race/Ethnicity have significant differences (*p=0.033*). Age distribution is relatively the same for children with recurrent wheezing and children without. No significant difference for month microbiome data was collected, but slight warm-season predominance (55-60%). For maternal atopy 70% of wheezers had atopic mothers vs. 37% (*p=0.005*). Similar for maternal asthma wqheezers had 3× higher prevalence (*55% vs. 17%, p<0.001*). Two fungal taxa were included at the bottom of Table 1 to illustrate the typical data structure: one showed a statistically significant difference between groups, while the other did not. It is important to note that the wheezing group is relatively small (*N = 20 out of 140 subjects*), which limits statistical power.
+
+In terms of actionable takeaways, maternal asthma was prioritized in this study given its strong association with recurrent wheezing. Additionally, the observed differences across race/ethnicity highlight the need to explore this varaible.
+
+## 4 Inspection of Potential Covariates {#variables}
+
+```{r, fig.width=10, fig.height=5}
+soft_palette <- c("#A6CEE3", "#B2DF8A", "#FDBF6F", "#CAB2D6", "#FFB3B3")
+
+p1 <- ggplot(cleandata, aes(x = recurrent_wheezing, y = age)) +
+  geom_boxplot(fill = "#A6CEE3", color = "#1F78B4") +
+  labs(title = "Age by Recurrent Wheezing", x = "Recurrent Wheezing", y = "Age") +
+  theme_classic() +
+  theme(panel.border = element_rect(color = "black", fill = NA))
+
+p2 <- ggplot(cleandata, aes(x = recurrent_wheezing, fill = sex)) +
+  geom_bar(position = "dodge", color = "black") +
+  scale_fill_manual(values = soft_palette[1:2]) +
+  labs(title = "Recurrent Wheezing by Sex", x = "Recurrent Wheezing", y = "Count", fill = "Sex") +
+  theme_classic() +
+  theme(panel.border = element_rect(color = "black", fill = NA))
+
+p3 <- ggplot(cleandata, aes(x = recurrent_wheezing, fill = race_ethnicity)) +
+  geom_bar(position = "dodge", color = "black") +
+  scale_fill_manual(values = soft_palette) +
+  labs(title = "Recurrent Wheezing by Race/Ethnicity", x = "Recurrent Wheezing", y = "Count", fill = "Race/Ethnicity") +
+  theme_classic() +
+  theme(panel.border = element_rect(color = "black", fill = NA))
+
+p4 <- ggplot(cleandata, aes(x = recurrent_wheezing, fill = warm_season)) +
+  geom_bar(position = "dodge", color = "black") +
+  scale_fill_manual(values = soft_palette[1:2]) +
+  labs(title = "Recurrent Wheezing by Season", x = "Recurrent Wheezing", y = "Count", fill = "Season") +
+  theme_classic() +
+  theme(panel.border = element_rect(color = "black", fill = NA))
+
+p5 <- ggplot(cleandata, aes(x = recurrent_wheezing, fill = maternal_atopy)) +
+  geom_bar(position = "dodge", color = "black") +
+  scale_fill_manual(values = soft_palette[1:2]) +
+  labs(title = "Recurrent Wheezing by Maternal Atopy", x = "Recurrent Wheezing", y = "Count", fill = "Maternal Atopy") +
+  theme_classic() +
+  theme(panel.border = element_rect(color = "black", fill = NA))
+
+p6 <- ggplot(cleandata, aes(x = recurrent_wheezing, fill = maternal_asthma)) +
+  geom_bar(position = "dodge", color = "black") +
+  scale_fill_manual(values = soft_palette[1:2]) +
+  labs(title = "Recurrent Wheezing by Maternal Asthma", x = "Recurrent Wheezing", y = "Count", fill = "Maternal Asthma") +
+  theme_classic() +
+  theme(panel.border = element_rect(color = "black", fill = NA))
+
+(p1 | p2)
+(p3 | p4)
+(p5 | p6)
+
+```
+
+```{r}
+metadata_no_id <- metadata[, !names(metadata) %in% "subject_id"]
+kable(summary(metadata_no_id), caption = "Summary of Metadata (excluding subject_id)")
+```
+
+## 5 Inspection of Fungi Variables {#fungi}
+
+```{r, fig.width=10}
+plot_histogram <- function(var, label){
+  ggplot(cleandata, aes(x = .data[[var]])) +
+    geom_histogram(fill = "skyblue", color = "black", bins = 10) +
+    labs(title = paste(label, "Distribution"), x = label, y = "Count") +
+    theme_classic() +
+    theme(panel.border = element_rect(color = "black", fill = NA))
+}
+
+p7 <- plot_histogram("Ascomycota_unclassified", "Ascomycota_unclassified")
+p8 <- plot_histogram("Curvularia", "Curvularia")
+p9 <- plot_histogram("Talaromyces", "Talaromyces")
+(p7 | p8 | p9)
+```
+
+<br>Something obvious that these distribution plots tell us is that fungi abundance for most fungi is very often 0. Only three plots were shown, because they all look very similar.
+
+## 6 Exploring Average Abundance and Prevalence among all Fungi {#stacked}
+
+```{r}
+funginames <- colnames(cleandata)[9:81]
+fungiinfo <- data.frame(
+  "Fungi" = funginames
+)
+
+fungicolumns <- cleandata[,9:81]
+fungiprevalence <- sapply(fungicolumns, function(col){
+  (sum(col != 0) / nrow(cleandata)) * 100
+})
+
+fungiinfo[,"Fungi Prevalence"] <- fungiprevalence[fungiinfo[,"Fungi"]]
+
+fungiabundance <- sapply(fungicolumns, function(col){
+  sum(col) / nrow(cleandata)
+})
+
+fungiinfo[, "Average.abundance"] <- fungiabundance[fungiinfo[,"Fungi"]]
+
+sort_fungi <- fungiinfo[order(-fungiinfo[, "Average.abundance"]), ]
+
+top_15 <- sort_fungi[1:15, c("Fungi", "Average.abundance")]
+
+palette <- c(
+  "#264653","#2a9d8f","#e76f51","#e9c46a","#8d99ae","#d90429","#6a994e",
+  "#9a031e","#007f5f","#5f0f40","#f08a5d","#588157","#ffba08","#3d405b","#bc6c25"
+)
+
+fungi_colors <- setNames(palette, top_15$Fungi)
+
+full_palette <- c(fungi_colors, "All Other" = "#999999")
+
+filtered_fungi <- fungiinfo[fungiinfo$Fungi %in% top_15$Fungi, ]
+
+top_fungi <- filtered_fungi[, c("Fungi", "Average.abundance")]
+
+other_abundance <- sum(fungiinfo$Average.abundance[!fungiinfo$Fungi %in% top_15$Fungi])
+
+other_row <- data.frame(
+  Fungi = "All Other",
+  Average.abundance = other_abundance
+)
+
+plot_data <- rbind(top_fungi, other_row)
+
+plot_data$Fungi <- factor(
+  plot_data$Fungi,
+  levels = c(top_15$Fungi, "All Other")
+)
+```
+
+```{r}
+fungaldatalong <- cleandata[, c("subject_id", "recurrent_wheezing", funginames)] %>% 
+  pivot_longer(cols = all_of(funginames),
+               names_to = "Fungi",
+               values_to = "Abundance")
+
+fungaldatalong <- fungaldatalong %>% 
+  mutate(Fungus2 = ifelse(Fungi %in% top_15$Fungi, Fungi, "All Other"))
+
+fungus2_summary <- fungaldatalong %>%
+  group_by(subject_id, recurrent_wheezing, Fungus2) %>%
+  summarise(Total_abundance = sum(Abundance), .groups = "drop")
+
+avg_data <- fungus2_summary %>%
+  group_by(recurrent_wheezing, Fungus2) %>%
+  summarise(AvgAbundance = mean(Total_abundance), .groups = "drop")
+
+avg_data <- avg_data %>%
+  group_by(recurrent_wheezing) %>%
+  mutate(Rank = ifelse(Fungus2 != "All Other", rank(-AvgAbundance, ties.method = "first"), NA)) %>%
+  ungroup()
+
+avg_data <- avg_data %>%
+  arrange(recurrent_wheezing, Rank) %>%
+  mutate(Fungus2 = factor(Fungus2, levels = unique(Fungus2)))
+
+fungaldatalong_filtered <- fungaldatalong %>%
+  filter(Fungi %in% top_15$Fungi) %>%
+  mutate(Fungi = factor(Fungi, levels = top_15$Fungi))
+```
+
+```{r}
+fungi_subject_summary <- fungaldatalong %>%
+  group_by(subject_id, recurrent_wheezing, Fungus2) %>%
+  summarise(TotalAbundance = sum(Abundance), .groups = "drop") %>%
+  mutate(Fungus2 = factor(Fungus2, levels = c(top_15$Fungi, "All Other")))
+
+cleandata[["race_ethnicity"]] <- ifelse(cleandata[["race_ethnicity"]] == "White (Non-Hispanic)","White (Non-Hispanic)", "Other")
+```
+
+```{r}
+ggplot(plot_data, aes(x = "", y = Average.abundance, fill = Fungi)) +
+  geom_bar(stat = "identity", width = 0.6) +  
+  labs(title = "Top 15 fungi by Average Abundance Across All Samples",
+       x = "Fungi", y = "Average Abundance") +
+  theme_classic() +
+  theme(panel.border = element_rect(color = "black", fill = NA)) +
+  scale_fill_manual(values = full_palette)
+```
+
+<br>We want to explore the top 15 fungi by average abundance across all samples. We can see that the top two bars are much larger than the rest of the other bars. Also something else to note is that the bottom half of the fungi abundances are very small. Therefore there is no reason to plot the other fungi, as it will not be informative. Therefore for the 58 other fungi we combine them into an "All Other" bar.
+
+```{r}
+ggplot(avg_data, aes(x = recurrent_wheezing, y = AvgAbundance, fill = Fungus2)) +
+  geom_bar(stat = "identity", position = "stack", width = .8) +
+  scale_fill_manual(values = c(fungi_colors, "All Other" = "#999999")) +
+  labs(title = "Average Fungal Abundance by Wheezing Status", x = "Recurrent Wheezing", y = "Average Abundance", fill = "Fungi") +
+  theme_classic() +
+  theme(panel.border = element_rect(color = "black", fill = NA))
+```
+
+<br>Using this plot we want to look if there are any potential fungi abundance differences for recurrent wheezing status. Something we can notice immediately is that *Ascomycota unclassified* seems to be more abundant in children with recurrent wheezing. We can also see that there is less diversity of fungi in children with recurrent wheezing. This is potentially because we only have 20 subjects that have recurrent wheezing.
+
+```{r}
+ggplot(fungi_subject_summary, aes(x = as.character(subject_id), y = TotalAbundance, fill = Fungus2)) +
+  geom_bar(stat = "identity") +
+  facet_grid(. ~ recurrent_wheezing, space = "free_x", scales = "free_x") +
+  scale_fill_manual(values = c(fungi_colors, "All Other" = "#999999")) +
+  labs(title = "Fungal Abundance by Subject and Wheezing Satus",x = "Subject", y = "Abundance", fill = "Fungi") +
+  theme_classic() +
+  theme(panel.border = element_rect(color = "black", fill = NA), axis.text.x = element_blank())
+```
+
+<br>Each bar represents a subject. Each different color in the bar are fungi abundances, and each subject stacks up to 1. The plot is divided into two groups, children who do not have recurrent wheezing and children that do have it. We plotted the top 15 most abundant fungi and for the other fungi we put them all in the bar "All Other" since their abundances are very small. From this plot it is not obvious there is one (or few) dominant fungi that are "always there". In addition it is not super obvious how the fungal mycobiome is different between wheezing vs. Non-Wheezing.
+
+```{r}
+fungiinfo[, "Average.abundance"] <- fungiabundance[fungiinfo[,"Fungi"]]
+
+hist(fungiinfo[,"Average.abundance"],
+     col = "skyblue",
+     border = "black",
+     main = "Average abundance Distribution",
+     xlab = "Average abundance Prevalence",
+     ylab = "Count",
+)
+box()
+
+```
+
+<br>Average abundance is the mean amount or level of that fungus measured among all subjects. We can see that most average abundance is between 0.00 to 0.02.
+
+```{r}
+hist(fungiinfo[,"Fungi Prevalence"],
+     col = "skyblue",
+     border = "black",
+     main = "Fungi Prevalence Distribution",
+     xlab = "Fungi Prevalence",
+     ylab = "Count",
+)
+box()
+```
+
+<br>Prevalence is calculated by how often a fungus is detected across all subjects (i.e., the proportion of subjects where the fungus is present). Most fungi have very small prevalence. There are only two fungi that have a prevalence higher than 25%.
+
+## 7 Logistic Regression Model {#logistic}
+We will examine the presence/absence of fungi vs recurrent wheezing, along with some covariates (logistic regression). For that we changed the fungi abundance to presence if it is greater than 0 it is present otherwise not present. The covariates we explored are race/ethnicity, season and maternal atopy. We ignore the warning of separation for now, we will address it later.<br>Let \( p \) represent the probability that fungi are present. The logistic regression model is then: 
+$$
+\log\left(\frac{p}{1 - p}\right) = \beta_0 + \beta_1(\text{Recurrent Wheezing}) + \beta_2(\text{Race/Ethnicity}) + \beta_3(\text{Warm Season}) + \beta_4(\text{Maternal Atopy})
+$$
+
+
+
+```{r}
+logisticregressiondata1 <- cleandata
+for(fungus in funginames){
+  logisticregressiondata1[[fungus]] <- ifelse(cleandata[[fungus]] > 0, 1, 0)
+}
+
+logisticregressionresults <- data.frame()
+
+for(fungus in funginames){
+  formula <- as.formula(paste(fungus, "~ recurrent_wheezing + race_ethnicity + warm_season + maternal_atopy"))
+  model <- glm(formula, data = logisticregressiondata1, family = binomial)
+  model_info <- coef(summary(model))
+  df <- data.frame(
+    Term = rownames(model_info),
+    Fungi = fungus,
+    Coefficient = model_info[,"Estimate"],
+    SE = model_info[,"Std. Error"],
+    P_Value = model_info[,"Pr(>|z|)"]
+  )
+  logisticregressionresults <- rbind(logisticregressionresults, df)
+}
+```
+
+We put the results of the 73 tests conducted into a table removing the intercept term and keeping only the p-values that are below 0.05.
+
+```{r}
+logisticregressionresults <- logisticregressionresults %>%
+  filter(!grepl("Intercept", Term)) %>%
+  mutate(Odds_Ratio = exp(Coefficient))
+
+# Filter p < 0.05
+significant_logistic <- logisticregressionresults %>% filter(P_Value <= 0.05)
+
+table_sig <- significant_logistic %>%
+  gt() %>%
+  fmt_number(columns = where(is.numeric), decimals = 3) %>%
+  tab_header(title = "Significant Logistic Regression Results (p<0.05)")
+
+table_sig
+```
+
+From this table we can see that recurrent wheezing status and the season the microbiome was collected have the most "significant" p-values (p<0.05). For the other covariates we only have two terms that are "significant".
+
+## 8 Issues in The Logistic Regression Model {#issues}
+
+We have two main issues when we ran all of our statistical tests. The first issue is of Quasi-complete separation. This occurs when a predictor perfectly predicts the outcome. Therefore when you run the model, the model tries to assign an infinite weight to that predictor, leading to unstable estimates and model convergence issues.
+
+```{r}
+ggplot(logisticregressionresults, aes(x = Coefficient)) +
+  geom_histogram(fill = "skyblue", color = "black", bins = 7) +
+  labs(title = "Log Odds Ratio Distribution", x = "Log Odds Ratio", y = "Count") +
+  theme_classic() +
+  theme(panel.border = element_rect(color = "black", fill = NA))
+```
+
+From this plot we can see that there are log odds ratio (coefficients) that have extreme values.<br>
+We can visualize this separation in the following plot.
+
+```{r}
+ggplot(logisticregressiondata1, aes(x = Ganoderma, y = warm_season)) +
+  geom_jitter(width = 0.1, height = 0.1, color = "steelblue") +
+  scale_x_continuous(breaks = c(0, 1)) +
+  labs(x = "Ganoderma Present (0/1)", y = "Season",
+       title = "Visualizing Separation in Logistic Regression") +
+  theme_classic()+
+  theme(panel.border = element_rect(color = "black", fill = NA))
+```
+
+We can see an example of quasi-complete separation. Specifically, during the Cold season (Nov–Mar), *Ganoderma* is never observed, resulting in no observed presence during the cold season. In contrast, during the Warm season (Apr–Oct), *Ganoderma* presence varies, with both presences and absences recorded. This imbalance can lead to instability in logistic regression estimates, particularly inflating the effect size of the Cold season predictor. To fix this issue we can use Firth's Penalized Logistic Regression Model. 
+<br>The second issue is that with multiple hypothesis tests (73 tests), the likelihood of false positives (Type 1 errors) increases substantially. A Type 1 error occurs when a test incorrectly rejects a true null hypothesis, suggesting a significant effect where none exists. For instance, with 73 tests, the chance of getting at least one false positive rises to over 97%. To mitigate this risk we will use Benjamini-Hochberg procedure, which adjust the threshold for statistical significance to account for the number of tests performed.
+
+## 9 Firth's Penalized Logistic Regression Model {#firths}
+
+Firth's Penalized Logistic Regression model applies a bias-reducing penalty to the likelihood. It produces finite, stable coefficient estimates, avoiding inflation seen in standard logistic regression models that have separation.<br>Let \( p \) represent the probability that fungi are present. The model is:
+
+$$
+\log\left(\frac{p}{1 - p}\right) = \beta_0 + \beta_1(\text{Recurrent Wheezing}) + \beta_2(\text{Race/Ethnicity}) + \beta_3(\text{Warm Season}) + \beta_4(\text{Maternal Atopy})
+$$
+
+This model is estimated using **Firth’s penalized likelihood approach**, which reduces small-sample bias and handles separation by modifying the likelihood function with a Jeffreys prior.
+
+
+```{r}
+logistf_data <- cleandata
+for(f in funginames){
+  logistf_data[[f]] <- ifelse(cleandata[[f]] > 0, 1, 0)
+}
+
+penalized_results <- data.frame()
+
+for(f in funginames){
+  fmodel <- logistf(as.formula(paste(f, "~ recurrent_wheezing + race_ethnicity + warm_season + maternal_atopy")), data = logistf_data)
+  temp <- data.frame(
+    Term = names(fmodel$coefficients),
+    Fungi = f,
+    Coefficient = fmodel$coefficients,
+    SE = sqrt(diag(fmodel$var)),
+    P_Value = fmodel$prob
+  )
+  penalized_results <- rbind(penalized_results, temp)
+}
+
+penalized_results <- penalized_results %>%
+  filter(!grepl("Intercept", Term)) %>%
+  mutate(Odds_Ratio = exp(Coefficient))
+
+df <- logisticregressionresults %>%
+  mutate(ID = paste(Term, Fungi, sep = "_")) %>%
+  select(ID, Coefficient) %>%
+  rename(Coefficient_Regular = Coefficient)
+
+df_df <- penalized_results %>%
+  mutate(ID = paste(Term, Fungi, sep = "_")) %>%
+  select(ID, Coefficient) %>%
+  rename(Coefficient_Penalized = Coefficient)
+
+combined_df <- merge(df, df_df, by = "ID", all = TRUE)
+
+combined_df <- combined_df %>%
+  mutate(highlight = ifelse(Coefficient_Regular > 5 | Coefficient_Regular < -5, "Extreme", "Normal"))
+
+ggplot(combined_df, aes(x = Coefficient_Regular, y = Coefficient_Penalized)) +
+  geom_point(aes(color = highlight), size = 3) +
+  scale_color_manual(values = c("Extreme" = "red", "Normal" = "skyblue")) +
+  labs(
+    title = "Scatterplot of Coefficients",
+    x = "Coefficient for Logistic Regression",
+    y = "Coefficient for Firth's Penalized Logistic Regression",
+    color = "Coefficient Type"
+  ) +
+  theme_classic() +
+  theme(panel.border = element_rect(color = "black", fill = NA))
+
+```
+<br>Using this scatterplot we compare the standard logistic regression to Firth's penalized logistic regression. We can see the key effect of penalization; it stabilizes the coefficient estimates (log odds ratios) by shrinking the values and preventing extreme of inflated estimates that arise with separation.<br>Doing Firth's penalized logistic regression p-values are affected therefore we can look at the new "significant" p-values.
+```{r}
+# Filter p < 0.05
+significant_logistic_pen <- penalized_results %>% filter(P_Value <= 0.05)
+
+table_sig_pen <- significant_logistic_pen %>%
+  gt() %>%
+  fmt_number(columns = where(is.numeric), decimals = 3) %>%
+  tab_header(title = "Significant Results from Firth Logistic Regression (p<0.05)")
+
+table_sig_pen
+```
+
+## 10 P-value Correction {#pval}
+To deal with our second issue of multiple hypothesis testing we implemented the Benjamini-Hochberg procedure to control the fase discovery rate (FDR). Given the limited sample size of our study (only 20 subjects in the wheezing group), we adopt a less stringent FDR threshold of < 0.2. This corresponds, roughly, to that, out of every five discoveries, we expect (at most) one to be false positive (the rest are true discoveries).<br>The Benjamini-Hochberg procedure controls the false discovery rate (FDR) by comparing each ordered p-value \( p_{(i)} \) to a threshold:
+
+$$
+p_{(i)} \leq \frac{i}{m} \cdot \alpha
+$$
+where \( i \) is the rank, \( m \) is the total number of tests, and \( \alpha \) is the desired FDR level.
+
+```{r}
+penalized_results_adj <- penalized_results %>%
+  group_by(Term) %>%
+  mutate(FDR_P_Value = p.adjust(P_Value, method = "fdr"))
+
+penalized_significant_.2 <- penalized_results_adj %>% filter(FDR_P_Value <= 0.2)
+
+penalized_significant_.2 %>%
+  gt() %>%
+  fmt_number(columns = where(is.numeric), decimals = 3) %>%
+  tab_header(title = "Significant Results from FDR adjustment (p<0.2)")
+
+
+```
+
+## 11 Conclusion {#conclusion}
+This study investigated the relationship between the airway fungal microbiome and recurrent wheezing while adjusting for various covariates. The fungal microbiome data were highly sparse, and the limited sample size brought up issues for conventional logistic regression, including issues of perfect separation that led to instability in the estimation of log odds ratios. To deal with this issue we employed Firth’s penalized logistic regression, which provided more reliable coefficient estimates under these conditions. Additionally, we applied the Benjamini-Hochberg procedure to control the false discovery rate across multiple hypothesis tests. One main finding is that the genus *Ganoderma* was found to be associated with recurrent wheezing (FDR-adjusted p < 0.052), suggesting a potential worth of further investigation. Several fungal taxa also showed significant associations with seasonal variation, aligning with our expectation. These finding highlight that there may be potential of further possible research with more data.
